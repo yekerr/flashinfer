@@ -26,6 +26,7 @@ from ..validation import (
     validate_routing_values,
 )
 from ..shared_expert import (
+    external_shared_planes,
     bind_shared_weights,
     prepare_shared_weights,
     validate_shared_weights,
@@ -411,6 +412,47 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         if num_tokens < capacity:
             workspace.topk_idx[num_tokens:capacity].fill_(-1)
         workspace.note_staged_tokens(num_tokens)
+
+    def external_staging_planes(
+        self, workspace: Any, num_tokens: int, tensors: "MoEEpTensors | None" = None
+    ) -> dict:
+        """Planes an external producer writes in place of :meth:`stage_inputs`.
+
+        NVFP4 packed E2M1 plain rows + one E4M3 scale per 16 columns under this
+        config's offline normalization (``offline_norm_const`` and
+        ``offline_scale_multiplier``: the values :func:`stage_mega_moe_inputs`
+        passes to ``fused_quant_stage``), int32 routes over the capacity, fp32
+        scores and, with a fused shared expert, its MXFP8 input
+        (:func:`external_shared_planes`). The per-call epilogue scalars are
+        bound as :meth:`stage_inputs` binds them (``tensors``' fc1_alpha /
+        fc2_alpha / fc1_norm_const; None = the config's). The staged-token memo
+        of the fused tail mask is reset to the capacity, so a later FlashInfer
+        staging into this pooled workspace re-masks every row.
+        """
+        if self._kernel_config.knobs == "auto" or self._kernel_config.batch_invariant:
+            raise MoEEpConfigError(
+                "external staging requires fixed knobs and the native staging layout"
+            )
+        from types import SimpleNamespace
+
+        from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
+
+        self._stage_scalars(
+            tensors if tensors is not None else SimpleNamespace(), workspace
+        )
+        note_staged_tokens(workspace.topk_idx, workspace.x.shape[0])
+        workspace.note_staged_tokens(num_tokens)
+        norm_const = self._kernel_config.input_norm_const
+        planes = dict(
+            x=workspace.x,
+            x_sf=workspace.x_sf,
+            topk_idx=workspace.topk_idx,
+            topk_weights=workspace.topk_weights,
+            offline_norm_const=norm_const,
+            offline_scale_multiplier=norm_const / 6.0,
+        )
+        planes.update(external_shared_planes(workspace, num_tokens))
+        return planes
 
     def _stage_scalars(self, t: "MoEEpTensors", workspace: Any) -> None:
         """Per-call NVFP4 epilogue scalars.

@@ -176,3 +176,31 @@ def stage_shared_inputs(tensors, workspace, *, quantize_input):
     workspace.shared_x_sf.view(torch.uint8).copy_(
         to_blocked(workspace.shared_x_sf_linear.view(torch.uint8))
     )
+
+
+def external_shared_planes(workspace, num_tokens):
+    """The fused shared expert's input planes for an external producer.
+
+    The producer writes rows ``[:num_tokens]`` of ``shared_activation`` (MXFP8
+    data) and the 128x4 swizzled E8M0 scales of rows
+    ``[:ceil(num_tokens / 128) * 128]`` of ``shared_activation_sf`` (zero past
+    ``num_tokens``). The rest of both planes is cleared here, as
+    :func:`stage_shared_inputs` clears it. The row-major ``shared_x_sf_linear``
+    (read by the correctness reference and autotune trials, not by the
+    kernel) is not written.
+    """
+    if workspace.config.shared_expert is None:
+        return {}
+    import torch
+
+    if num_tokens < workspace.shared_x.shape[0]:
+        workspace.shared_x[num_tokens:].view(torch.uint8).zero_()
+    rows = -(-num_tokens // 128) * 128
+    cols = -(-(workspace.shared_x.shape[1] // 32) // 4) * 4
+    scales = workspace.shared_x_sf.view(torch.uint8)
+    if rows * cols < scales.numel():
+        scales[rows * cols :].zero_()
+    return {
+        "shared_activation": workspace.shared_x,
+        "shared_activation_sf": workspace.shared_x_sf,
+    }

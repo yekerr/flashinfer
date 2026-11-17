@@ -737,6 +737,57 @@ class MoEEpMegaLayer(nn.Module):
         self._staged_workspace = backend_workspace
         self._staged_transformed = transformed_weights
 
+    def stage_external(
+        self,
+        num_tokens: int,
+        *,
+        workspace: MoEEpMegaWorkspace,
+        tensors: MoEEpTensors | None = None,
+    ) -> dict[str, Any]:
+        """Hand ``workspace``'s input planes to an external producer for one invocation.
+
+        The producer (e.g. a fused gate + routing + quantization front) writes
+        the planes itself in place of :meth:`stage_inputs`; :meth:`compute_staged`
+        then launches the kernel on them. Returned planes (backend-defined;
+        SM107 MX: ``x`` / ``x_sf`` plain rows, ``topk_idx`` over the whole
+        capacity, ``topk_weights``, and with a fused shared expert
+        ``shared_activation`` / ``shared_activation_sf`` (128x4 swizzled);
+        SM107 NVFP4: the same planes in its format plus the float scalars
+        ``offline_norm_const`` / ``offline_scale_multiplier`` the producer
+        quantizes with). The producer must write rows ``[:num_tokens]`` of every
+        plane, ``-1`` into ``topk_idx[num_tokens:]`` and the swizzled shared
+        scales of rows ``[:ceil(num_tokens / 128) * 128]`` before
+        :meth:`compute_staged`, on the same stream.
+        ``tensors``: per-call fields a backend binds at staging (SM107 NVFP4:
+        fc1_alpha / fc2_alpha / fc1_norm_const; activations and routes are not
+        read); None passes nothing. Collective like ``forward``.
+        """
+        if isinstance(num_tokens, bool) or not isinstance(num_tokens, int):
+            raise TypeError("num_tokens must be an int")
+        fleet_params, backend_workspace, kernel = self._resolve_workspace(workspace)
+        if not 0 <= num_tokens <= fleet_params.max_tokens_per_rank:
+            raise MoEEpConfigError(
+                f"{num_tokens} tokens outside [0, {fleet_params.max_tokens_per_rank}]"
+            )
+        planes = getattr(kernel, "external_staging_planes", None)
+        if planes is None:
+            raise MoEEpConfigError("this MegaMoE backend has no external staging entry")
+        if not self._bootstrap_validated:
+            ensure_bootstrap_dist_validated(self._bootstrap)
+            self._bootstrap_validated = True
+        transformed_weights = self._get_transformed_weights()
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            kernel.validate_capture_ready(backend_workspace, transformed_weights)
+        kernel.set_compile_tokens_per_rank(backend_workspace, None)
+        if tensors is None:
+            out = planes(backend_workspace, num_tokens)
+        else:
+            out = planes(backend_workspace, num_tokens, tensors=tensors)
+        self._staged_kernel = kernel
+        self._staged_workspace = backend_workspace
+        self._staged_transformed = transformed_weights
+        return out
+
     def compute_staged(self, *, output: torch.Tensor | None) -> torch.Tensor:
         """Launch the kernel using inputs staged by :meth:`stage_inputs`."""
 

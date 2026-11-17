@@ -22,6 +22,7 @@ from ......core.validation.common import (
 from ......weights import MoEWeightPack
 from ..validation import validate_routing_values, validate_unit_scalars
 from ..shared_expert import (
+    external_shared_planes,
     bind_shared_weights,
     prepare_shared_weights,
     validate_shared_weights,
@@ -419,6 +420,34 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         if num_tokens < capacity:
             workspace.topk_idx[num_tokens:capacity].fill_(-1)
         workspace.note_staged_tokens(num_tokens)
+
+    def external_staging_planes(self, workspace: Any, num_tokens: int) -> dict:
+        """Planes an external producer writes in place of :meth:`stage_inputs`.
+
+        MXFP8 per-32 E8M0 plain rows, int32 routes over the whole capacity (-1
+        past ``num_tokens``), fp32 scores and, with a fused shared expert, its
+        MXFP8 input (:func:`external_shared_planes`). The staged-token memo of
+        the fused tail mask is reset to the capacity, so a later FlashInfer
+        staging into this pooled workspace re-masks every row.
+        """
+        if self._kernel_config.knobs == "auto" or getattr(
+            self._kernel_config, "batch_invariant", False
+        ):
+            raise MoEEpConfigError(
+                "external staging requires fixed knobs and the native staging layout"
+            )
+        from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
+
+        note_staged_tokens(workspace.topk_idx, workspace.x.shape[0])
+        workspace.note_staged_tokens(num_tokens)
+        planes = dict(
+            x=workspace.x,
+            x_sf=workspace.x_sf,
+            topk_idx=workspace.topk_idx,
+            topk_weights=workspace.topk_weights,
+        )
+        planes.update(external_shared_planes(workspace, num_tokens))
+        return planes
 
     def compute(
         self,
