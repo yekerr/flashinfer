@@ -409,7 +409,34 @@ class Nvfp4MegaMoERuntime:
             act=self.act, act_sf=self.act_sf, shared_act=self.sh_act, shared_act_sf=self.sh_sf,
             ids_out=self.topk_idx, weights_out=self.topk_w, eplb=eplb,
         )
-        y = torch.empty((bucket, self.hidden), dtype=torch.bfloat16, device=x.device)
+        return self.launch(bucket, layer_kwargs)
+
+    # ----------------------------------------------------------------------------------------- external staging
+    def external_planes(self, bucket: int) -> dict:
+        """The planes ``run`` stages, for a producer that writes them itself (e.g. a fused gate + routing + staging
+        front); :meth:`launch` then runs the ``bucket`` variant on them, on the same stream.
+
+        The producer owes what ``staging.stage_nvfp4_mxfp8`` writes for ``rows=bucket``: rows ``[:n]`` of ``act``
+        (packed E2M1, ``[max_tokens, H/2]`` uint8), ``act_sf`` (E4M3 per 16, ``[max_tokens, H/16]`` uint8),
+        ``shared_act`` (E4M3, ``[max_tokens, H]`` uint8) and ``shared_act_sf`` (UE8M0 per 32, flat 32x4x4 swizzle, flat
+        uint8); all ``bucket`` rows of ``topk_idx`` (``[bucket, topk]`` int32 physical ids) and ``topk_weights``
+        (``[bucket, topk]`` float32), with ``-1`` / ``0`` for padded rows and rows ``>= n``. Views, not copies.
+        """
+        if bucket not in self.compiled:
+            raise ValueError(f"NVFP4 MegaMoE bucket {bucket} is not compiled (buckets {self.buckets})")
+        u8 = torch.uint8
+        return {
+            "act": self.act,
+            "act_sf": self.act_sf.view(u8),
+            "shared_act": self.sh_act.view(u8),
+            "shared_act_sf": self.sh_sf,
+            "topk_idx": self.topk_idx[:bucket],
+            "topk_weights": self.topk_w[:bucket],
+        }
+
+    def launch(self, bucket: int, layer_kwargs: dict) -> torch.Tensor:
+        """Launch the compiled ``bucket`` variant on the staged planes; returns ``[bucket, H]`` BF16 (routed + shared)."""
+        y = torch.empty((bucket, self.hidden), dtype=torch.bfloat16, device=self.device)
         kwargs = {**self._buffer_kwargs[bucket], **layer_kwargs, "output_activation": to_cute(y, assumed_align=32),
                   "stream": current_cu_stream()}
         self.compiled[bucket](**kwargs)
